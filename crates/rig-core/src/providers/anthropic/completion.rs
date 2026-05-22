@@ -150,6 +150,11 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: serde_json::Value,
+    /// Cache breakpoint marker. Set on the **last** tool in the array to cache
+    /// the Tools layer independently of the system prompt. Anthropic accepts up
+    /// to 4 `cache_control` markers per request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// TTL for a cache control breakpoint.
@@ -1804,6 +1809,43 @@ pub fn apply_cache_control(system: &mut [SystemContent], messages: &mut [Message
     }
 }
 
+
+/// Mark the last tool definition with `cache_control: ephemeral` so Anthropic
+/// caches the tools layer independently of the system prompt. No-op when `tools` is empty.
+pub fn mark_last_tool_for_cache(tools: &mut [ToolDefinition], ttl: Option<CacheTtl>) {
+    if let Some(last) = tools.last_mut() {
+        last.cache_control = Some(match ttl {
+            Some(CacheTtl::OneHour) => CacheControl::ephemeral_1h(),
+            _ => CacheControl::ephemeral(),
+        });
+    }
+}
+
+/// Mark the last assistant message's final content block with `cache_control:
+/// ephemeral` to cache the conversation history layer. Clears any pre-existing
+/// markers first. The final user turn is never marked — it is volatile per-request content.
+pub fn mark_history_for_cache(messages: &mut [Message], ttl: Option<CacheTtl>) {
+    for msg in messages.iter_mut() {
+        for content in msg.content.iter_mut() {
+            set_content_cache_control(content, None);
+        }
+    }
+
+    if let Some(last_assistant) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+    {
+        set_content_cache_control(
+            last_assistant.content.last_mut(),
+            Some(match ttl {
+                Some(CacheTtl::OneHour) => CacheControl::ephemeral_1h(),
+                _ => CacheControl::ephemeral(),
+            }),
+        );
+    }
+}
+
 pub(super) fn split_system_messages_from_history(
     history: Vec<message::Message>,
 ) -> (Vec<SystemContent>, Vec<message::Message>) {
@@ -1883,6 +1925,7 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
                 name: tool.name,
                 description: Some(tool.description),
                 input_schema: tool.parameters,
+                cache_control: None,
             })
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()?;
@@ -3850,5 +3893,67 @@ mod tests {
         };
 
         assert_eq!(document.additional_params, None);
+    }
+
+
+    #[test]
+    fn test_mark_last_tool_for_cache_sets_last_only() {
+        let mut tools = vec![
+            ToolDefinition {
+                name: "a".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            },
+            ToolDefinition {
+                name: "b".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            },
+        ];
+        mark_last_tool_for_cache(&mut tools, Some(CacheTtl::OneHour));
+        assert!(tools[0].cache_control.is_none(), "first tool must not be marked");
+        assert_eq!(
+            tools[1].cache_control,
+            Some(CacheControl::ephemeral_1h()),
+            "last tool must carry the 1h marker"
+        );
+    }
+
+    #[test]
+    fn test_mark_history_for_cache_marks_last_assistant_not_user() {
+        let make_msg = |role: Role, text: &str| Message {
+            role,
+            content: OneOrMany::one(Content::Text {
+                text: text.to_string(),
+                citations: vec![],
+                cache_control: None,
+            }),
+        };
+
+        let mut messages = vec![
+            make_msg(Role::User, "Hello"),
+            make_msg(Role::Assistant, "Hi"),
+            make_msg(Role::User, "Follow-up"),
+        ];
+
+        mark_history_for_cache(&mut messages, None);
+
+        let get_cc = |msg: &Message| {
+            if let Content::Text { cache_control, .. } = msg.content.last() {
+                cache_control.clone()
+            } else {
+                panic!("unexpected content variant")
+            }
+        };
+
+        assert!(get_cc(&messages[0]).is_none(), "first user message must not be marked");
+        assert_eq!(
+            get_cc(&messages[1]),
+            Some(CacheControl::ephemeral()),
+            "assistant turn must be marked"
+        );
+        assert!(get_cc(&messages[2]).is_none(), "last user message must not be marked");
     }
 }
