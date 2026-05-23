@@ -1475,6 +1475,14 @@ pub struct GenericCompletionModel<Ext = super::client::AnthropicExt, T = reqwest
     /// Set to `Some(CacheTtl::OneHour)` for a 1-hour TTL (requires the
     /// `extended-cache-ttl-2025-04-11` beta header).
     pub automatic_caching_ttl: Option<CacheTtl>,
+    /// Cache the tools layer. `Some(ttl)` marks the last ToolDefinition with
+    /// `cache_control: ephemeral` (or `1h`) so Anthropic caches all tools
+    /// independently of the system prompt. `None` disables tools caching.
+    pub tools_caching: Option<CacheTtl>,
+    /// Cache the conversation history layer. `Some(ttl)` marks the final
+    /// content block of the last assistant message with `cache_control:
+    /// ephemeral` (or `1h`). `None` disables history caching.
+    pub history_caching: Option<CacheTtl>,
 }
 
 /// Anthropic completion model.
@@ -1500,6 +1508,8 @@ where
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            tools_caching: None,
+            history_caching: None,
         }
     }
 
@@ -1512,6 +1522,8 @@ where
             prompt_caching: false,
             automatic_caching: false,
             automatic_caching_ttl: None,
+            tools_caching: None,
+            history_caching: None,
         }
     }
 
@@ -1583,6 +1595,49 @@ where
     pub fn with_automatic_caching_1h(mut self) -> Self {
         self.automatic_caching = true;
         self.automatic_caching_ttl = Some(CacheTtl::OneHour);
+        self
+    }
+
+    /// Cache the tools layer independently of the system prompt.
+    ///
+    /// Sets `cache_control: ephemeral` on the last `ToolDefinition` in the
+    /// array so Anthropic caches all tools up to that point. Anthropic accepts
+    /// up to 4 `cache_control` markers per request across the system, tools,
+    /// and history layers.
+    pub fn with_tools_caching(mut self) -> Self {
+        self.tools_caching = Some(CacheTtl::FiveMinutes);
+        self
+    }
+
+    /// Cache the tools layer with a 1-hour TTL.
+    ///
+    /// Identical to [`with_tools_caching`] but uses the extended 1-hour TTL.
+    /// Requires the `extended-cache-ttl-2025-04-11` beta header.
+    ///
+    /// [`with_tools_caching`]: GenericCompletionModel::with_tools_caching
+    pub fn with_tools_caching_1h(mut self) -> Self {
+        self.tools_caching = Some(CacheTtl::OneHour);
+        self
+    }
+
+    /// Cache the conversation history layer.
+    ///
+    /// Sets `cache_control: ephemeral` on the final content block of the last
+    /// assistant message so Anthropic caches the conversation up to that point.
+    /// The current user turn is never marked — it is volatile per-request content.
+    pub fn with_history_caching(mut self) -> Self {
+        self.history_caching = Some(CacheTtl::FiveMinutes);
+        self
+    }
+
+    /// Cache the conversation history layer with a 1-hour TTL.
+    ///
+    /// Identical to [`with_history_caching`] but uses the extended 1-hour TTL.
+    /// Requires the `extended-cache-ttl-2025-04-11` beta header.
+    ///
+    /// [`with_history_caching`]: GenericCompletionModel::with_history_caching
+    pub fn with_history_caching_1h(mut self) -> Self {
+        self.history_caching = Some(CacheTtl::OneHour);
         self
     }
 }
@@ -1809,6 +1864,36 @@ pub fn apply_cache_control(system: &mut [SystemContent], messages: &mut [Message
     }
 }
 
+/// Mark the last tool definition with `cache_control` so Anthropic caches the
+/// tools layer independently of the system prompt. No-op when `tools` is empty.
+pub(super) fn mark_last_tool_for_cache(tools: &mut [ToolDefinition], ttl: CacheTtl) {
+    if let Some(last) = tools.last_mut() {
+        last.cache_control = Some(match ttl {
+            CacheTtl::OneHour => CacheControl::ephemeral_1h(),
+            CacheTtl::FiveMinutes => CacheControl::ephemeral(),
+        });
+    }
+}
+
+/// Mark the final content block of the last assistant message with `cache_control`
+/// to cache the conversation history layer. The current user turn is never marked —
+/// it is volatile per-request content.
+pub(super) fn mark_history_for_cache(messages: &mut [Message], ttl: CacheTtl) {
+    if let Some(last_assistant) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+    {
+        set_content_cache_control(
+            last_assistant.content.last_mut(),
+            Some(match ttl {
+                CacheTtl::OneHour => CacheControl::ephemeral_1h(),
+                CacheTtl::FiveMinutes => CacheControl::ephemeral(),
+            }),
+        );
+    }
+}
+
 pub(super) fn split_system_messages_from_history(
     history: Vec<message::Message>,
 ) -> (Vec<SystemContent>, Vec<message::Message>) {
@@ -1841,6 +1926,10 @@ pub struct AnthropicRequestParams<'a> {
     pub automatic_caching: bool,
     /// TTL for the top-level cache_control. `None` omits the `ttl` field (API default is 5 min).
     pub automatic_caching_ttl: Option<CacheTtl>,
+    /// Cache the tools layer. `Some(ttl)` marks the last ToolDefinition.
+    pub tools_caching: Option<CacheTtl>,
+    /// Cache the history layer. `Some(ttl)` marks the last assistant message's final block.
+    pub history_caching: Option<CacheTtl>,
 }
 
 impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
@@ -1853,6 +1942,8 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
             prompt_caching,
             automatic_caching,
             automatic_caching_ttl,
+            tools_caching,
+            history_caching,
         } = params;
 
         // Check if max_tokens is set, required for Anthropic
@@ -1881,7 +1972,7 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
         let mut additional_tools =
             extract_tools_from_additional_params(&mut additional_params_payload)?;
 
-        let mut tools = req
+        let mut typed_tools: Vec<ToolDefinition> = req
             .tools
             .into_iter()
             .map(|tool| ToolDefinition {
@@ -1890,6 +1981,12 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
                 input_schema: tool.parameters,
                 cache_control: None,
             })
+            .collect();
+        if let Some(ttl) = tools_caching {
+            mark_last_tool_for_cache(&mut typed_tools, ttl);
+        }
+        let mut tools = typed_tools
+            .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()?;
         tools.append(&mut additional_tools);
@@ -1912,6 +2009,9 @@ impl TryFrom<AnthropicRequestParams<'_>> for AnthropicCompletionRequest {
         // Apply cache control breakpoints only if prompt_caching is enabled
         if prompt_caching {
             apply_cache_control(&mut system, &mut messages);
+        }
+        if let Some(ttl) = history_caching {
+            mark_history_for_cache(&mut messages, ttl);
         }
 
         let output_config = if let Some(schema) = req.output_schema {
@@ -2025,6 +2125,8 @@ where
             prompt_caching: self.prompt_caching,
             automatic_caching: self.automatic_caching,
             automatic_caching_ttl: self.automatic_caching_ttl.clone(),
+            tools_caching: self.tools_caching.clone(),
+            history_caching: self.history_caching.clone(),
         })?;
 
         if enabled!(Level::TRACE) {
@@ -3856,5 +3958,75 @@ mod tests {
         };
 
         assert_eq!(document.additional_params, None);
+    }
+
+    #[test]
+    fn test_mark_last_tool_for_cache_sets_last_only() {
+        let mut tools = vec![
+            ToolDefinition {
+                name: "a".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            },
+            ToolDefinition {
+                name: "b".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+            },
+        ];
+        mark_last_tool_for_cache(&mut tools, CacheTtl::OneHour);
+        assert!(
+            tools[0].cache_control.is_none(),
+            "first tool must not be marked"
+        );
+        assert_eq!(
+            tools[1].cache_control,
+            Some(CacheControl::ephemeral_1h()),
+            "last tool must carry the 1h marker"
+        );
+    }
+
+    #[test]
+    fn test_mark_history_for_cache_marks_last_assistant_not_user() {
+        let make_msg = |role: Role, text: &str| Message {
+            role,
+            content: OneOrMany::one(Content::Text {
+                text: text.to_string(),
+                citations: vec![],
+                cache_control: None,
+            }),
+        };
+
+        let mut messages = vec![
+            make_msg(Role::User, "Hello"),
+            make_msg(Role::Assistant, "Hi"),
+            make_msg(Role::User, "Follow-up"),
+        ];
+
+        mark_history_for_cache(&mut messages, CacheTtl::FiveMinutes);
+
+        let get_cc = |msg: &Message| {
+            if let Content::Text { cache_control, .. } = msg.content.last() {
+                cache_control.clone()
+            } else {
+                panic!("unexpected content variant")
+            }
+        };
+
+        assert!(
+            get_cc(&messages[0]).is_none(),
+            "first user message must not be marked"
+        );
+        assert_eq!(
+            get_cc(&messages[1]),
+            Some(CacheControl::ephemeral()),
+            "assistant turn must be marked"
+        );
+        assert!(
+            get_cc(&messages[2]).is_none(),
+            "last user message must not be marked"
+        );
     }
 }
