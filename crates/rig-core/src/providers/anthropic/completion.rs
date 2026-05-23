@@ -1603,20 +1603,10 @@ where
     /// Sets `cache_control: ephemeral` on the last `ToolDefinition` in the
     /// array so Anthropic caches all tools up to that point. Anthropic accepts
     /// up to 4 `cache_control` markers per request across the system, tools,
-    /// and history layers.
-    pub fn with_tools_caching(mut self) -> Self {
-        self.tools_caching = Some(CacheTtl::FiveMinutes);
-        self
-    }
-
-    /// Cache the tools layer with a 1-hour TTL.
-    ///
-    /// Identical to [`with_tools_caching`] but uses the extended 1-hour TTL.
-    /// Requires the `extended-cache-ttl-2025-04-11` beta header.
-    ///
-    /// [`with_tools_caching`]: GenericCompletionModel::with_tools_caching
-    pub fn with_tools_caching_1h(mut self) -> Self {
-        self.tools_caching = Some(CacheTtl::OneHour);
+    /// and history layers. Use [`CacheTtl::OneHour`] to opt into the extended
+    /// TTL beta (`extended-cache-ttl-2025-04-11` header required).
+    pub fn with_tools_caching(mut self, ttl: CacheTtl) -> Self {
+        self.tools_caching = Some(ttl);
         self
     }
 
@@ -1625,19 +1615,9 @@ where
     /// Sets `cache_control: ephemeral` on the final content block of the last
     /// assistant message so Anthropic caches the conversation up to that point.
     /// The current user turn is never marked — it is volatile per-request content.
-    pub fn with_history_caching(mut self) -> Self {
-        self.history_caching = Some(CacheTtl::FiveMinutes);
-        self
-    }
-
-    /// Cache the conversation history layer with a 1-hour TTL.
-    ///
-    /// Identical to [`with_history_caching`] but uses the extended 1-hour TTL.
-    /// Requires the `extended-cache-ttl-2025-04-11` beta header.
-    ///
-    /// [`with_history_caching`]: GenericCompletionModel::with_history_caching
-    pub fn with_history_caching_1h(mut self) -> Self {
-        self.history_caching = Some(CacheTtl::OneHour);
+    /// Use [`CacheTtl::OneHour`] to opt into the extended TTL beta.
+    pub fn with_history_caching(mut self, ttl: CacheTtl) -> Self {
+        self.history_caching = Some(ttl);
         self
     }
 }

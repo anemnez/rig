@@ -6,7 +6,7 @@ use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
 use super::completion::{
-    AnthropicCompatibleProvider, CacheControl, CacheTtl, Content, GenericCompletionModel, Message,
+    AnthropicCompatibleProvider, CacheControl, Content, GenericCompletionModel, Message,
     SystemContent, ToolChoice, ToolDefinition, Usage, apply_cache_control, mark_history_for_cache,
     mark_last_tool_for_cache, split_system_messages_from_history,
 };
