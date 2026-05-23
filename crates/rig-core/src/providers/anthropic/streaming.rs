@@ -6,9 +6,9 @@ use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
 use super::completion::{
-    AnthropicCompatibleProvider, CacheControl, Content, GenericCompletionModel, Message,
-    SystemContent, ToolChoice, ToolDefinition, Usage, apply_cache_control,
-    split_system_messages_from_history,
+    AnthropicCompatibleProvider, CacheControl, CacheTtl, Content, GenericCompletionModel, Message,
+    SystemContent, ToolChoice, ToolDefinition, Usage, apply_cache_control, mark_history_for_cache,
+    mark_last_tool_for_cache, split_system_messages_from_history,
 };
 use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
 use crate::http_client::sse::{Event, GenericEventSource};
@@ -236,6 +236,9 @@ where
         if self.prompt_caching {
             apply_cache_control(&mut system, &mut messages);
         }
+        if let Some(ttl) = self.history_caching.clone() {
+            mark_history_for_cache(&mut messages, ttl);
+        }
 
         let mut body = json!({
             "model": request_model,
@@ -272,7 +275,7 @@ where
         let mut additional_tools =
             extract_tools_from_additional_params(&mut additional_params_payload)?;
 
-        let mut tools = completion_request
+        let mut typed_tools: Vec<ToolDefinition> = completion_request
             .tools
             .into_iter()
             .map(|tool| ToolDefinition {
@@ -281,6 +284,12 @@ where
                 input_schema: tool.parameters,
                 cache_control: None,
             })
+            .collect();
+        if let Some(ttl) = self.tools_caching.clone() {
+            mark_last_tool_for_cache(&mut typed_tools, ttl);
+        }
+        let mut tools = typed_tools
+            .into_iter()
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()?;
         tools.append(&mut additional_tools);
