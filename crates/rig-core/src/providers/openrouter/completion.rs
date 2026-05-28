@@ -573,6 +573,19 @@ impl ProviderPreferences {
 
 /// A openrouter completion object.
 ///
+/// Image item returned by image-generation models via the DALL-E-compatible
+/// top-level `data` array (e.g. `google/gemini-3.1-flash-image-preview`).
+/// Either `b64_json` (base64-encoded PNG/JPEG) or `url` is populated.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ImageGenerationData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b64_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revised_prompt: Option<String>,
+}
+
 /// For more information, see this link: <https://docs.openrouter.xyz/reference/create_chat_completion_v1_chat_completions_post>
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompletionResponse {
@@ -583,6 +596,10 @@ pub struct CompletionResponse {
     pub choices: Vec<Choice>,
     pub system_fingerprint: Option<String>,
     pub usage: Option<Usage>,
+    /// Image-generation models (e.g. gemini-3.1-flash-image-preview) return
+    /// generated images here, DALL-E-style, alongside an empty choices entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<ImageGenerationData>,
 }
 
 impl From<ApiErrorResponse> for CompletionError {
@@ -595,11 +612,10 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     type Error = CompletionError;
 
     fn try_from(response: CompletionResponse) -> Result<Self, Self::Error> {
-        let choice = response.choices.first().ok_or_else(|| {
-            CompletionError::ResponseError("Response contained no choices".to_owned())
-        })?;
-
-        let content = match &choice.message {
+        // Image-generation models may return images in the top-level `data`
+        // field with an empty choices array. Only error on no-choices when
+        // there are also no data images.
+        let content = if let Some(choice) = response.choices.first() { match &choice.message {
             Message::Assistant {
                 content,
                 tool_calls,
@@ -708,7 +724,47 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             _ => Err(CompletionError::ResponseError(
                 "Response did not contain a valid message or tool call".into(),
             )),
-        }?;
+        }? } else {
+            // No choices — image-generation model with data-only response.
+            if response.data.is_empty() {
+                return Err(CompletionError::ResponseError(
+                    "Response contained no choices".to_owned(),
+                ));
+            }
+            vec![]
+        };
+
+        // DALL-E-style `data` array — used by image-generation models
+        // (e.g. gemini-3.1-flash-image-preview) that return images here
+        // rather than in `choices[0].message.images`.
+        let mut content = content;
+        for img_data in &response.data {
+            let block = if let Some(b64) = &img_data.b64_json {
+                completion::AssistantContent::image_base64(
+                    b64.clone(),
+                    Some(message::ImageMediaType::PNG), // assume PNG; no explicit mime in DALL-E format
+                    None,
+                )
+            } else if let Some(url) = &img_data.url {
+                if let Some((mime, b64)) = parse_data_uri(url) {
+                    completion::AssistantContent::image_base64(
+                        b64.to_string(),
+                        message::ImageMediaType::from_mime_type(mime),
+                        None,
+                    )
+                } else {
+                    completion::AssistantContent::Image(message::Image {
+                        data: message::DocumentSourceKind::Url(url.clone()),
+                        media_type: None,
+                        detail: None,
+                        additional_params: None,
+                    })
+                }
+            } else {
+                continue;
+            };
+            content.push(block);
+        }
 
         let choice = OneOrMany::many(content).map_err(|_| {
             CompletionError::ResponseError(
