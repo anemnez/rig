@@ -195,11 +195,12 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             } => {
                 let mut content = content
                     .iter()
-                    .map(|c| match c {
-                        AssistantContent::Text { text } => completion::AssistantContent::text(text),
+                    .filter_map(|c| match c {
+                        AssistantContent::Text { text } => Some(completion::AssistantContent::text(text)),
                         AssistantContent::Refusal { refusal } => {
-                            completion::AssistantContent::text(refusal)
+                            Some(completion::AssistantContent::text(refusal))
                         }
+                        AssistantContent::ImageUrl { .. } => None,
                     })
                     .collect::<Vec<_>>();
 

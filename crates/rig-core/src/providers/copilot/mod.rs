@@ -539,6 +539,7 @@ impl TryFrom<ChatCompletionResponse> for completion::CompletionResponse<ChatComp
                         let s = match c {
                             openai::completion::AssistantContent::Text { text } => text,
                             openai::completion::AssistantContent::Refusal { refusal } => refusal,
+                            openai::completion::AssistantContent::ImageUrl { .. } => return None,
                         };
                         if s.is_empty() {
                             None

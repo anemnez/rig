@@ -633,6 +633,23 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                         openai::AssistantContent::Refusal { refusal } => {
                             completion::AssistantContent::text(refusal)
                         }
+                        openai::AssistantContent::ImageUrl { image_url } => {
+                            let url = &image_url.url;
+                            if let Some((mime, b64)) = parse_data_uri(url) {
+                                completion::AssistantContent::image_base64(
+                                    b64.to_string(),
+                                    message::ImageMediaType::from_mime_type(mime),
+                                    None,
+                                )
+                            } else {
+                                completion::AssistantContent::Image(message::Image {
+                                    data: message::DocumentSourceKind::Url(url.clone()),
+                                    media_type: None,
+                                    detail: None,
+                                    additional_params: None,
+                                })
+                            }
+                        }
                     })
                     .collect::<Vec<_>>();
 

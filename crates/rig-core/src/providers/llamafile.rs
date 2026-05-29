@@ -192,9 +192,10 @@ fn flatten_user_content(content: &crate::OneOrMany<openai::UserContent>) -> Opti
 }
 
 fn flatten_assistant_content(content: &[openai::AssistantContent]) -> String {
-    join_text_segments(content.iter().map(|item| match item {
-        openai::AssistantContent::Text { text } => text.clone(),
-        openai::AssistantContent::Refusal { refusal } => refusal.clone(),
+    join_text_segments(content.iter().filter_map(|item| match item {
+        openai::AssistantContent::Text { text } => Some(text.clone()),
+        openai::AssistantContent::Refusal { refusal } => Some(refusal.clone()),
+        openai::AssistantContent::ImageUrl { .. } => None,
     }))
 }
 

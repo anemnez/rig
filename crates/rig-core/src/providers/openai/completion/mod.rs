@@ -222,6 +222,11 @@ pub enum SystemContentType {
 pub enum AssistantContent {
     Text { text: String },
     Refusal { refusal: String },
+    /// Image URL content part — emitted by image-generation models (e.g.
+    /// Gemini image preview) as `{"type":"image_url","image_url":{"url":"..."}}`.
+    /// Inbound only; never serialized back into requests.
+    #[serde(rename = "image_url", skip_serializing)]
+    ImageUrl { image_url: ImageUrl },
 }
 
 impl From<AssistantContent> for completion::AssistantContent {
@@ -229,6 +234,15 @@ impl From<AssistantContent> for completion::AssistantContent {
         match value {
             AssistantContent::Text { text, .. } => completion::AssistantContent::text(text),
             AssistantContent::Refusal { refusal } => completion::AssistantContent::text(refusal),
+            AssistantContent::ImageUrl { image_url } => {
+                use crate::message::{DocumentSourceKind, Image};
+                completion::AssistantContent::Image(Image {
+                    data: DocumentSourceKind::Url(image_url.url),
+                    media_type: None,
+                    detail: Some(image_url.detail),
+                    additional_params: None,
+                })
+            }
         }
     }
 }
@@ -758,12 +772,8 @@ impl TryFrom<Message> for message::Message {
                     assistant_content.push(message::AssistantContent::reasoning(reasoning));
                 }
 
-                assistant_content.extend(content.into_iter().map(|content| match content {
-                    AssistantContent::Text { text, .. } => message::AssistantContent::text(text),
-                    AssistantContent::Refusal { refusal } => {
-                        message::AssistantContent::text(refusal)
-                    }
-                }));
+                assistant_content
+                    .extend(content.into_iter().map(|content| message::AssistantContent::from(content)));
 
                 assistant_content.extend(
                     tool_calls
@@ -924,6 +934,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                         let s = match c {
                             AssistantContent::Text { text, .. } => text,
                             AssistantContent::Refusal { refusal } => refusal,
+                            AssistantContent::ImageUrl { .. } => return None,
                         };
                         if s.is_empty() {
                             None
@@ -1041,6 +1052,7 @@ fn assistant_message_text_response(message: &Message) -> Option<String> {
         .filter_map(|content| match content {
             AssistantContent::Text { text, .. } => (!text.is_empty()).then(|| text.clone()),
             AssistantContent::Refusal { refusal } => (!refusal.is_empty()).then(|| refusal.clone()),
+            AssistantContent::ImageUrl { .. } => None,
         })
         .collect::<Vec<_>>();
 
