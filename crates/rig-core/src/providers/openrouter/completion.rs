@@ -615,133 +615,135 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
         // Image-generation models may return images in the top-level `data`
         // field with an empty choices array. Only error on no-choices when
         // there are also no data images.
-        let content = if let Some(choice) = response.choices.first() { match &choice.message {
-            Message::Assistant {
-                content,
-                tool_calls,
-                reasoning,
-                reasoning_details,
-                images,
-                ..
-            } => {
-                let mut content = content
-                    .iter()
-                    .map(|c| match c {
-                        openai::AssistantContent::Text { text, .. } => {
-                            completion::AssistantContent::text(text)
-                        }
-                        openai::AssistantContent::Refusal { refusal } => {
-                            completion::AssistantContent::text(refusal)
-                        }
-                        openai::AssistantContent::ImageUrl { image_url } => {
-                            let url = &image_url.url;
-                            if let Some((mime, b64)) = parse_data_uri(url) {
-                                completion::AssistantContent::image_base64(
-                                    b64.to_string(),
-                                    message::ImageMediaType::from_mime_type(mime),
-                                    None,
-                                )
-                            } else {
-                                completion::AssistantContent::Image(message::Image {
-                                    data: message::DocumentSourceKind::Url(url.clone()),
-                                    media_type: None,
-                                    detail: None,
-                                    additional_params: None,
-                                })
+        let content = if let Some(choice) = response.choices.first() {
+            match &choice.message {
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    reasoning,
+                    reasoning_details,
+                    images,
+                    ..
+                } => {
+                    let mut content = content
+                        .iter()
+                        .map(|c| match c {
+                            openai::AssistantContent::Text { text, .. } => {
+                                completion::AssistantContent::text(text)
                             }
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                            openai::AssistantContent::Refusal { refusal } => {
+                                completion::AssistantContent::text(refusal)
+                            }
+                            openai::AssistantContent::ImageUrl { image_url } => {
+                                let url = &image_url.url;
+                                if let Some((mime, b64)) = parse_data_uri(url) {
+                                    completion::AssistantContent::image_base64(
+                                        b64.to_string(),
+                                        message::ImageMediaType::from_mime_type(mime),
+                                        None,
+                                    )
+                                } else {
+                                    completion::AssistantContent::Image(message::Image {
+                                        data: message::DocumentSourceKind::Url(url.clone()),
+                                        media_type: None,
+                                        detail: None,
+                                        additional_params: None,
+                                    })
+                                }
+                            }
+                        })
+                        .collect::<Vec<_>>();
 
-                content.extend(tool_calls.iter().map(|call| {
-                    completion::AssistantContent::tool_call(
-                        &call.id,
-                        &call.function.name,
-                        call.function.arguments.clone(),
-                    )
-                }));
+                    content.extend(tool_calls.iter().map(|call| {
+                        completion::AssistantContent::tool_call(
+                            &call.id,
+                            &call.function.name,
+                            call.function.arguments.clone(),
+                        )
+                    }));
 
-                let mut grouped_reasoning: HashMap<
-                    Option<String>,
-                    Vec<(usize, usize, message::ReasoningContent)>,
-                > = HashMap::new();
-                let mut reasoning_order: Vec<Option<String>> = Vec::new();
-                for (position, detail) in reasoning_details.iter().enumerate() {
-                    let (reasoning_id, sort_index, parsed_content) = match detail {
-                        ReasoningDetails::Summary {
-                            id, index, summary, ..
-                        } => (
-                            id.clone(),
-                            *index,
-                            Some(message::ReasoningContent::Summary(summary.clone())),
-                        ),
-                        ReasoningDetails::Encrypted {
-                            id, index, data, ..
-                        } => (
-                            id.clone(),
-                            *index,
-                            Some(message::ReasoningContent::Encrypted(data.clone())),
-                        ),
-                        ReasoningDetails::Text {
-                            id,
-                            index,
-                            text,
-                            signature,
-                            ..
-                        } => (
-                            id.clone(),
-                            *index,
-                            text.as_ref().map(|text| message::ReasoningContent::Text {
-                                text: text.clone(),
-                                signature: signature.clone(),
-                            }),
-                        ),
-                    };
+                    let mut grouped_reasoning: HashMap<
+                        Option<String>,
+                        Vec<(usize, usize, message::ReasoningContent)>,
+                    > = HashMap::new();
+                    let mut reasoning_order: Vec<Option<String>> = Vec::new();
+                    for (position, detail) in reasoning_details.iter().enumerate() {
+                        let (reasoning_id, sort_index, parsed_content) = match detail {
+                            ReasoningDetails::Summary {
+                                id, index, summary, ..
+                            } => (
+                                id.clone(),
+                                *index,
+                                Some(message::ReasoningContent::Summary(summary.clone())),
+                            ),
+                            ReasoningDetails::Encrypted {
+                                id, index, data, ..
+                            } => (
+                                id.clone(),
+                                *index,
+                                Some(message::ReasoningContent::Encrypted(data.clone())),
+                            ),
+                            ReasoningDetails::Text {
+                                id,
+                                index,
+                                text,
+                                signature,
+                                ..
+                            } => (
+                                id.clone(),
+                                *index,
+                                text.as_ref().map(|text| message::ReasoningContent::Text {
+                                    text: text.clone(),
+                                    signature: signature.clone(),
+                                }),
+                            ),
+                        };
 
-                    let Some(parsed_content) = parsed_content else {
-                        continue;
-                    };
-                    let sort_index = sort_index.unwrap_or(position);
-
-                    let entry = grouped_reasoning.entry(reasoning_id.clone());
-                    if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
-                        reasoning_order.push(reasoning_id);
-                    }
-                    entry
-                        .or_default()
-                        .push((sort_index, position, parsed_content));
-                }
-
-                if grouped_reasoning.is_empty() {
-                    if let Some(reasoning) = reasoning {
-                        content.push(completion::AssistantContent::reasoning(reasoning));
-                    }
-                } else {
-                    for reasoning_id in reasoning_order {
-                        let Some(mut blocks) = grouped_reasoning.remove(&reasoning_id) else {
+                        let Some(parsed_content) = parsed_content else {
                             continue;
                         };
-                        blocks.sort_by_key(|(index, position, _)| (*index, *position));
-                        content.push(completion::AssistantContent::Reasoning(
-                            message::Reasoning {
-                                id: reasoning_id,
-                                content: blocks
-                                    .into_iter()
-                                    .map(|(_, _, content)| content)
-                                    .collect::<Vec<_>>(),
-                            },
-                        ));
+                        let sort_index = sort_index.unwrap_or(position);
+
+                        let entry = grouped_reasoning.entry(reasoning_id.clone());
+                        if matches!(entry, std::collections::hash_map::Entry::Vacant(_)) {
+                            reasoning_order.push(reasoning_id);
+                        }
+                        entry
+                            .or_default()
+                            .push((sort_index, position, parsed_content));
                     }
+
+                    if grouped_reasoning.is_empty() {
+                        if let Some(reasoning) = reasoning {
+                            content.push(completion::AssistantContent::reasoning(reasoning));
+                        }
+                    } else {
+                        for reasoning_id in reasoning_order {
+                            let Some(mut blocks) = grouped_reasoning.remove(&reasoning_id) else {
+                                continue;
+                            };
+                            blocks.sort_by_key(|(index, position, _)| (*index, *position));
+                            content.push(completion::AssistantContent::Reasoning(
+                                message::Reasoning {
+                                    id: reasoning_id,
+                                    content: blocks
+                                        .into_iter()
+                                        .map(|(_, _, content)| content)
+                                        .collect::<Vec<_>>(),
+                                },
+                            ));
+                        }
+                    }
+
+                    content.extend(images.iter().map(response_image_to_assistant_content));
+
+                    Ok(content)
                 }
-
-                content.extend(images.iter().map(response_image_to_assistant_content));
-
-                Ok(content)
-            }
-            _ => Err(CompletionError::ResponseError(
-                "Response did not contain a valid message or tool call".into(),
-            )),
-        }? } else {
+                _ => Err(CompletionError::ResponseError(
+                    "Response did not contain a valid message or tool call".into(),
+                )),
+            }?
+        } else {
             // No choices — image-generation model with data-only response.
             if response.data.is_empty() {
                 return Err(CompletionError::ResponseError(
@@ -1343,50 +1345,54 @@ impl TryFrom<OneOrMany<message::UserContent>> for Vec<Message> {
             .into_iter()
             .partition(|content| matches!(content, message::UserContent::ToolResult(_)));
 
-        // If there are messages with both tool results and user content, we handle
-        // tool results first. It's unlikely that there will be both.
-        if !tool_results.is_empty() {
-            tool_results
-                .into_iter()
-                .map(|content| match content {
-                    message::UserContent::ToolResult(tool_result) => Ok(Message::ToolResult {
-                        tool_call_id: tool_result.id,
-                        content: tool_result
-                            .content
-                            .into_iter()
-                            .map(|c| match c {
-                                message::ToolResultContent::Text(message::Text {
-                                    text, ..
-                                }) => text,
-                                message::ToolResultContent::Image(_) => {
-                                    "[Image content not supported in tool results]".to_string()
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    }),
-                    _ => Err(message::MessageError::ConversionError(
-                        "expected tool result content while converting OpenRouter input".into(),
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()
-        } else {
-            let user_content: Vec<UserContent> = other_content
-                .into_iter()
-                .map(|content| content.try_into())
-                .collect::<Result<Vec<_>, _>>()?;
+        // A user message may carry BOTH tool results and other content (the
+        // Anthropic-canonical shape an agent loop produces when it appends a
+        // note after a turn's tool results). The chat-completions wire has no
+        // such message: tool results are `role: tool` messages and a `role:
+        // user` message may follow them. Emit the tool results first and the
+        // other content as its own user message — dropping it (the previous
+        // behavior) silently discarded every such note.
+        let mut messages: Vec<Message> = tool_results
+            .into_iter()
+            .map(|content| match content {
+                message::UserContent::ToolResult(tool_result) => Ok(Message::ToolResult {
+                    tool_call_id: tool_result.id,
+                    content: tool_result
+                        .content
+                        .into_iter()
+                        .map(|c| match c {
+                            message::ToolResultContent::Text(message::Text { text, .. }) => text,
+                            message::ToolResultContent::Image(_) => {
+                                "[Image content not supported in tool results]".to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                }),
+                _ => Err(message::MessageError::ConversionError(
+                    "expected tool result content while converting OpenRouter input".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-            let content = OneOrMany::many(user_content).map_err(|_| {
-                message::MessageError::ConversionError(
-                    "OpenRouter user message did not contain any non-tool content".into(),
-                )
-            })?;
-
-            Ok(vec![Message::User {
+        let had_tool_results = !messages.is_empty();
+        let user_content: Vec<UserContent> = other_content
+            .into_iter()
+            .map(|content| content.try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        match OneOrMany::many(user_content) {
+            Ok(content) => messages.push(Message::User {
                 content,
                 name: None,
-            }])
+            }),
+            Err(_) if had_tool_results => {}
+            Err(_) => {
+                return Err(message::MessageError::ConversionError(
+                    "OpenRouter user message did not contain any non-tool content".into(),
+                ));
+            }
         }
+        Ok(messages)
     }
 }
 

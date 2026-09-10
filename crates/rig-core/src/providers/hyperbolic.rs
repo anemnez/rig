@@ -196,7 +196,9 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 let mut content = content
                     .iter()
                     .filter_map(|c| match c {
-                        AssistantContent::Text { text } => Some(completion::AssistantContent::text(text)),
+                        AssistantContent::Text { text } => {
+                            Some(completion::AssistantContent::text(text))
+                        }
                         AssistantContent::Refusal { refusal } => {
                             Some(completion::AssistantContent::text(refusal))
                         }

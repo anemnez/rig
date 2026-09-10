@@ -220,13 +220,19 @@ pub enum SystemContentType {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum AssistantContent {
-    Text { text: String },
-    Refusal { refusal: String },
+    Text {
+        text: String,
+    },
+    Refusal {
+        refusal: String,
+    },
     /// Image URL content part — emitted by image-generation models (e.g.
     /// Gemini image preview) as `{"type":"image_url","image_url":{"url":"..."}}`.
     /// Inbound only; never serialized back into requests.
     #[serde(rename = "image_url", skip_serializing)]
-    ImageUrl { image_url: ImageUrl },
+    ImageUrl {
+        image_url: ImageUrl,
+    },
 }
 
 impl From<AssistantContent> for completion::AssistantContent {
@@ -629,35 +635,43 @@ impl TryFrom<OneOrMany<message::UserContent>> for Vec<Message> {
             .into_iter()
             .partition(|content| matches!(content, message::UserContent::ToolResult(_)));
 
-        // If there are messages with both tool results and user content, openai will only
-        //  handle tool results. It's unlikely that there will be both.
-        if !tool_results.is_empty() {
-            tool_results
-                .into_iter()
-                .map(|content| match content {
-                    message::UserContent::ToolResult(tool_result) => tool_result.try_into(),
-                    _ => Err(message::MessageError::ConversionError(
-                        "expected tool result content while converting OpenAI input".into(),
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()
-        } else {
-            let other_content: Vec<UserContent> = other_content
-                .into_iter()
-                .map(|content| content.try_into())
-                .collect::<Result<Vec<_>, _>>()?;
+        // A user message may carry BOTH tool results and other content — the
+        // Anthropic-canonical shape (`tool_result` blocks followed by text) that
+        // an agent loop produces when it appends a note after a turn's tool
+        // results. The chat-completions wire has no such message: tool results
+        // are `role: tool` messages, and the API accepts a `role: user` message
+        // after them. So emit the tool results first and the other content as
+        // its own user message. Dropping the other content here (the previous
+        // behavior: "openai will only handle tool results") silently discarded
+        // every such note.
+        let mut messages: Vec<Message> = tool_results
+            .into_iter()
+            .map(|content| match content {
+                message::UserContent::ToolResult(tool_result) => tool_result.try_into(),
+                _ => Err(message::MessageError::ConversionError(
+                    "expected tool result content while converting OpenAI input".into(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-            let other_content = OneOrMany::many(other_content).map_err(|_| {
-                message::MessageError::ConversionError(
-                    "OpenAI user message did not contain any non-tool content".into(),
-                )
-            })?;
-
-            Ok(vec![Message::User {
-                content: other_content,
+        let had_tool_results = !messages.is_empty();
+        let other_content: Vec<UserContent> = other_content
+            .into_iter()
+            .map(|content| content.try_into())
+            .collect::<Result<Vec<_>, _>>()?;
+        match OneOrMany::many(other_content) {
+            Ok(content) => messages.push(Message::User {
+                content,
                 name: None,
-            }])
+            }),
+            Err(_) if had_tool_results => {}
+            Err(_) => {
+                return Err(message::MessageError::ConversionError(
+                    "OpenAI user message did not contain any non-tool content".into(),
+                ));
+            }
         }
+        Ok(messages)
     }
 }
 
@@ -772,8 +786,11 @@ impl TryFrom<Message> for message::Message {
                     assistant_content.push(message::AssistantContent::reasoning(reasoning));
                 }
 
-                assistant_content
-                    .extend(content.into_iter().map(|content| message::AssistantContent::from(content)));
+                assistant_content.extend(
+                    content
+                        .into_iter()
+                        .map(|content| message::AssistantContent::from(content)),
+                );
 
                 assistant_content.extend(
                     tool_calls
@@ -1525,6 +1542,62 @@ where
 mod tests {
     use super::*;
     use crate::telemetry::ProviderResponseExt;
+
+    /// A user message carrying tool results AND text (the shape an agent
+    /// loop produces when it appends a note after a turn's tool results)
+    /// reaches the chat-completions wire as the tool messages FOLLOWED BY a
+    /// user message with the text. The previous conversion kept only the
+    /// tool results — every such note was silently dropped from the request.
+    #[test]
+    fn test_user_message_with_tool_results_and_text_keeps_the_text() {
+        let content = crate::OneOrMany::many(vec![
+            message::UserContent::tool_result(
+                "call-1",
+                crate::OneOrMany::one(message::ToolResultContent::text("result one")),
+            ),
+            message::UserContent::tool_result(
+                "call-2",
+                crate::OneOrMany::one(message::ToolResultContent::text("result two")),
+            ),
+            message::UserContent::text("[CONTEXT] fullness: 1/2 tokens"),
+        ])
+        .expect("three parts");
+
+        let messages: Vec<Message> = content.try_into().expect("conversion succeeds");
+        assert_eq!(
+            messages.len(),
+            3,
+            "two tool messages then one user message: {messages:?}"
+        );
+        assert!(
+            matches!(&messages[0], Message::ToolResult { tool_call_id, .. } if tool_call_id == "call-1")
+        );
+        assert!(
+            matches!(&messages[1], Message::ToolResult { tool_call_id, .. } if tool_call_id == "call-2")
+        );
+        match &messages[2] {
+            Message::User { content, .. } => {
+                let text = match content.first() {
+                    UserContent::Text { text } => text,
+                    other => panic!("expected the note as text, got {other:?}"),
+                };
+                assert_eq!(text, "[CONTEXT] fullness: 1/2 tokens");
+            }
+            other => {
+                panic!("expected the note as a user message after the tool results, got {other:?}")
+            }
+        }
+
+        // Tool results alone still convert to tool messages only.
+        let only_results: Vec<Message> = crate::OneOrMany::one(message::UserContent::tool_result(
+            "call-3",
+            crate::OneOrMany::one(message::ToolResultContent::text("r")),
+        ))
+        .try_into()
+        .expect("conversion succeeds");
+        assert_eq!(only_results.len(), 1);
+        assert!(matches!(&only_results[0], Message::ToolResult { .. }));
+    }
 
     #[test]
     fn test_openai_request_uses_request_model_override() {

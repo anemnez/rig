@@ -13,3 +13,6 @@ target/
 # nodejs stuff
 node_modules/
 dist/
+
+# prova's per-workspace lock dir (conducts run from substrate drop it here)
+.prova/
